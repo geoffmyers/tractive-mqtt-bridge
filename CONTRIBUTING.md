@@ -48,6 +48,17 @@ TRACTIVE_USERNAME=x TRACTIVE_PASSWORD=x TRACTIVE_USER_ID=x TRACTIVE_CLIENT_ID=x 
 
 <!-- CHECKS:END -->
 
+<!-- RELEASES:START -->
+### Container images
+
+Every push to `main` builds these for `linux/amd64` and `linux/arm64` and
+pushes them to the GitHub Container Registry ([`.github/workflows/images.yml`](.github/workflows/images.yml)),
+tagged `latest` and `sha-<commit>`:
+
+- `ghcr.io/geoffmyers/tractive-mqtt-bridge`: `Dockerfile`, with the application code added
+
+<!-- RELEASES:END -->
+
 ## Before you open a pull request
 
 - Keep the change focused. One concern per PR is much easier to review.
