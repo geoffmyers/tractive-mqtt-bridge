@@ -26,6 +26,7 @@ import time
 from typing import Callable
 
 import requests
+from ha_mqtt_bridge import request_with_backoff
 
 from parsers import TimelineEvent, parse_events
 
@@ -75,12 +76,18 @@ class EventStream:
             self._seen_order = self._seen_order[-SEEN_EVENTS_CAP:]
 
     def fetch_page(self, token: str, auth_headers_fn, params: dict) -> dict:
+        """GET with exponential backoff on 429/5xx (shared toolkit
+        helper — same one `main.py`'s `_request` uses). Previously this
+        raised a bare, unretried `RuntimeError` on the first 429; the
+        MED-cycle caller's `except Exception` swallowed it (non-fatal),
+        but every rate-limited poll was silently dropped instead of
+        retried."""
         headers = auth_headers_fn(token)
-        r = requests.get(EVENT_TL_BASE + "events", headers=headers, params=params, timeout=20)
+        r = request_with_backoff(
+            "GET", EVENT_TL_BASE + "events", headers=headers, params=params, timeout=20,
+        )
         if r.status_code == 401:
             raise PermissionError("event-timeline 401")
-        if r.status_code == 429:
-            raise RuntimeError("event-timeline 429")
         r.raise_for_status()
         return r.json()
 
@@ -201,9 +208,16 @@ class ChannelClient:
 
     @property
     def stale(self) -> bool:
-        """True if no message has arrived in CHANNEL_STALE_AFTER seconds."""
+        """True if the channel is connected but nothing (not even a
+        keep-alive) has arrived in CHANNEL_STALE_AFTER seconds.
+
+        A channel that is not connected is not stale: it is starting, or
+        its own loop is already reconnecting with backoff. Replacing it then
+        resets that backoff and briefly runs two connections, which is how
+        the first version of this check drew a 429 on startup (2026-09-17).
+        """
         if not self._connected:
-            return True
+            return False
         return (time.time() - self._last_message_at) > CHANNEL_STALE_AFTER
 
     def start(self) -> None:

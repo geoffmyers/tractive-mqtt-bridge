@@ -155,6 +155,8 @@ Environment variables, set in `.env` (`.env.example` lists them all):
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USER` | *(empty)* | MQTT username |
 | `MQTT_PASSWORD` | *(required)* | MQTT password |
+| `MQTT_TLS` | `0` | Set to `1` for a broker that requires TLS |
+| `MQTT_CA_FILE` | *(unset)* | Path to a custom CA bundle; leave unset to use the system trust store (only consulted when `MQTT_TLS=1`) |
 | `FAST_POLL_INTERVAL` | `90` | Seconds; back-stop poll used when the real-time push channel is silent |
 | `MED_POLL_INTERVAL` | `300` | Seconds; activity/bark/scratch/health-monitor/separation/event polls |
 | `SLOW_POLL_INTERVAL` | `3600` | Seconds; weekly report, account, subscriptions, shares |

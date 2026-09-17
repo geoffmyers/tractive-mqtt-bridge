@@ -34,16 +34,17 @@ Every push and pull request runs these checks in GitHub Actions
 ([`.github/workflows/checks.yml`](.github/workflows/checks.yml)), and every release has passed them.
 To run one yourself, use the same commands from the directory shown.
 
-**compile + import smoke test** (Python 3.12, from `app/`):
+**tests** (Python 3.12, from `app/`):
 
 ```bash
 python -m venv /tmp/venv
 . /tmp/venv/bin/activate
 pip install --quiet --upgrade pip
-pip install --quiet -r requirements.txt
+pip install --quiet -r requirements.txt 'pytest>=8'
 pip install --quiet ../_shared/ha-mqtt-bridge-toolkit ../_shared/python-github-error-reporter
 python -m compileall -q .
 TRACTIVE_USERNAME=x TRACTIVE_PASSWORD=x TRACTIVE_USER_ID=x TRACTIVE_CLIENT_ID=x MQTT_PASSWORD=x python -c "import main"
+TRACTIVE_USERNAME=x TRACTIVE_PASSWORD=x TRACTIVE_USER_ID=x TRACTIVE_CLIENT_ID=x MQTT_PASSWORD=x python -m pytest -q
 ```
 
 <!-- CHECKS:END -->

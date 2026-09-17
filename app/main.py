@@ -83,6 +83,8 @@ from ha_mqtt_bridge import (
     ThreadedPublisher,
     configure_logging,
     register_github_error_reporter,
+    request_with_backoff,
+    watch_ha_birth,
 )
 
 from discovery import (
@@ -161,6 +163,11 @@ MQTT_HOST = os.environ.get("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ["MQTT_PASSWORD"]
+# Off by default (current behaviour) — set MQTT_TLS=1 for a broker that
+# requires TLS; MQTT_CA_FILE points at a custom CA bundle (system trust
+# store is used when unset).
+MQTT_TLS = os.environ.get("MQTT_TLS", "0") != "0"
+MQTT_CA_FILE = os.environ.get("MQTT_CA_FILE") or None
 
 # `POLL_INTERVAL` is the Phase-1 legacy name for FAST_POLL_INTERVAL — kept
 # as a fallback for the existing .env file (default 90 s).
@@ -202,11 +209,15 @@ BRIDGE_LWT_TOPIC = f"{TOPIC_PREFIX}/bridge/online"
 
 
 def _request(method: str, url: str, *, headers: dict | None = None, json_body: dict | None = None, params: dict | None = None):
-    r = requests.request(method, url, headers=headers, json=json_body, params=params, timeout=15)
+    """Exponential backoff on 429/5xx (shared toolkit helper — also used
+    by `events.py`'s `EventStream.fetch_page`). A 429/5xx that survives
+    every retry raises `RetryExhaustedError` (a `RuntimeError`
+    subclass); the main loop's per-cycle `except Exception` guards catch
+    that instead of it killing the process — previously this raised a
+    bare, unguarded `RuntimeError` straight out of pet/tracker discovery."""
+    r = request_with_backoff(method, url, headers=headers, json_body=json_body, params=params, timeout=15)
     if r.status_code == 401:
         raise PermissionError(f"401 from {url}")
-    if r.status_code == 429:
-        raise RuntimeError(f"429 rate limit from {url}")
     r.raise_for_status()
     # `/4/user/{uid}/notifications` returns the literal empty string when
     # there are no notifications, which would explode r.json(). Treat any
@@ -777,6 +788,37 @@ def _handle_channel_message(pub: ThreadedPublisher,
         publish_health(pub, pet.pet_id, parse_health_overview(msg))
 
 
+def reconnect_channel_if_stale(
+    channel: ChannelClient | None,
+    make_channel,
+    log: logging.Logger,
+) -> ChannelClient | None:
+    """If the push channel has gone stale, tear it down and start a
+    fresh one via `make_channel()`.
+
+    `ChannelClient.stale` existed but nothing ever read it: the
+    channel's own internal reconnect loop only fires on a genuine
+    socket-level disconnect or read timeout, which doesn't cover a
+    connection that is technically still open (bytes still arriving —
+    HTTP chunk boundaries, TCP keepalives) but has stopped delivering
+    any actual message for longer than `CHANNEL_STALE_AFTER`. This is
+    the periodic, main-loop-driven check that closes that gap.
+
+    `channel is None` (channel disabled, or not started yet) is a no-op
+    — returns `channel` unchanged. A non-stale channel is likewise
+    returned unchanged, so callers can unconditionally reassign their
+    local variable to this function's return value every loop
+    iteration.
+    """
+    if channel is None or not channel.stale:
+        return channel
+    log.warning("push channel stale; reconnecting")
+    channel.stop()
+    new_channel = make_channel()
+    new_channel.start()
+    return new_channel
+
+
 def discover_pets(token: str, log: logging.Logger) -> list[Pet]:
     """Resolve every pet on the account. The bridge iterates this list
     across all tier handlers, so adding a second tracker to the Tractive
@@ -934,7 +976,7 @@ def main() -> int:
         host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USER, password=MQTT_PASS,
         client_id=f"tractive-mqtt-bridge-{uuid.uuid4().hex[:8]}",
         lwt_topic=BRIDGE_LWT_TOPIC, discovery_prefix=DISCOVERY_PREFIX,
-        health_path="/tmp/healthy",
+        health_path="/tmp/healthy", tls=MQTT_TLS, ca_file=MQTT_CA_FILE,
     )
     pub.start()
 
@@ -942,6 +984,7 @@ def main() -> int:
     device_to_pet: dict[str, Pet] = {}
     event_streams: dict[str, EventStream] = {}
     discovery_published = False
+    backfill_done = False
     stopping = False
     channel: ChannelClient | None = None
     # `current_token` holds the live access token in a one-element list so
@@ -960,6 +1003,29 @@ def main() -> int:
         stopping = True
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+
+    def make_channel() -> ChannelClient:
+        return ChannelClient(
+            auth_headers_fn=lambda: _auth_headers(current_token[0]),
+            on_message=lambda msg: _handle_channel_message(
+                pub, device_to_pet, msg, log,
+            ),
+            log=log,
+        )
+
+    def _on_ha_birth() -> None:
+        # HA republishes nothing on its own restart; retained discovery
+        # configs usually survive in the broker, but not always. Re-run
+        # discovery and nudge every tier to run on the next loop
+        # iteration so current state follows quickly behind.
+        nonlocal discovery_published, next_fast, next_med, next_slow
+        log.info("HA birth message received; re-publishing discovery and refreshing state")
+        discovery_published = False
+        next_fast = 0.0
+        next_med = 0.0
+        next_slow = 0.0
+
+    watch_ha_birth(pub, _on_ha_birth, discovery_prefix=DISCOVERY_PREFIX)
 
     while not stopping:
         try:
@@ -999,7 +1065,11 @@ def main() -> int:
                 log.info("discovery published: %d entities across %d pet(s) + account",
                          total, len(pets))
 
-                # Per-pet backfills + event streams.
+            if not backfill_done:
+                # Per-pet backfills + event streams. Independent of
+                # discovery_published so an HA-birth re-publish of
+                # discovery doesn't also re-run a full history backfill
+                # and restart an already-healthy push channel.
                 for p in pets:
                     try:
                         backfill_positions(pub, p, access, POSITION_BACKFILL_HOURS, log)
@@ -1017,14 +1087,11 @@ def main() -> int:
                 # Phase 4 — single push channel for the account; routes
                 # messages to the right pet by tracker_id at dispatch time.
                 if CHANNEL_ENABLED:
-                    channel = ChannelClient(
-                        auth_headers_fn=lambda: _auth_headers(current_token[0]),
-                        on_message=lambda msg: _handle_channel_message(
-                            pub, device_to_pet, msg, log,
-                        ),
-                        log=log,
-                    )
+                    channel = make_channel()
                     channel.start()
+                backfill_done = True
+
+            channel = reconnect_channel_if_stale(channel, make_channel, log)
 
             now = time.monotonic()
             if now >= next_fast:
@@ -1073,6 +1140,14 @@ def main() -> int:
                 time.sleep(30)
         except requests.RequestException as e:
             log.error("network/HTTP error: %s", e)
+        except Exception:
+            # Last-resort guard for the main loop itself — e.g. a
+            # RetryExhaustedError surfacing from pet/tracker discovery,
+            # which (unlike the FAST/MED/SLOW tier runners) isn't wrapped
+            # in its own per-call try/except. Previously this class of
+            # error propagated straight out of `main()` and killed the
+            # process.
+            log.exception("poll cycle failed unexpectedly")
 
         # Sleep until the soonest next-tier deadline, capped at 1 s
         # granularity so SIGTERM stays responsive.

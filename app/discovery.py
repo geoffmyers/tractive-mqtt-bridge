@@ -100,10 +100,6 @@ def _account_device_block() -> dict:
     )
 
 
-def _slugify(s: str) -> str:
-    return s.lower().replace("_", "_")
-
-
 # Phase 2 per-pet entity definitions. Format: (component, slug, name, extras).
 # `extras` are splatted into build_discovery_payload as keyword args; common
 # fields like state_topic + unique_id + device are added by the loop below.
