@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/icon.svg" width="96" height="96" alt="Tractive MQTT Bridge icon">
+  <img src="docs/icon.svg" width="256" height="256" alt="Tractive MQTT Bridge icon">
 </p>
 
 # Tractive MQTT Bridge
